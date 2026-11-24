@@ -1,0 +1,604 @@
+export type V4aPatchOperation = V4aAddOperation | V4aDeleteOperation | V4aUpdateOperation;
+
+export interface V4aAddOperation {
+	readonly kind: "add";
+	readonly path: string;
+	readonly content: string;
+}
+
+export interface V4aDeleteOperation {
+	readonly kind: "delete";
+	readonly path: string;
+}
+
+export interface V4aUpdateOperation {
+	readonly kind: "update";
+	readonly path: string;
+	readonly moveTo?: string;
+	readonly hunks: readonly V4aUpdateHunk[];
+}
+
+export interface V4aUpdateHunk {
+	readonly anchor?: string;
+	readonly anchors?: readonly string[];
+	readonly endOfFile?: true;
+	readonly lines: readonly V4aUpdateLine[];
+}
+
+export type V4aUpdateLine = V4aContextLine | V4aAddedLine | V4aRemovedLine;
+
+export interface V4aContextLine {
+	readonly kind: "context";
+	readonly text: string;
+	readonly noNewline?: true;
+}
+
+export interface V4aAddedLine {
+	readonly kind: "add";
+	readonly text: string;
+	readonly noNewline?: true;
+}
+
+export interface V4aRemovedLine {
+	readonly kind: "remove";
+	readonly text: string;
+	readonly noNewline?: true;
+}
+
+export interface V4aPatch {
+	readonly operations: readonly V4aPatchOperation[];
+}
+
+export interface V4aPatchConflict {
+	readonly path: string;
+	readonly operationIndices: readonly number[];
+	readonly message: string;
+}
+
+interface SourceLine {
+	readonly text: string;
+	readonly newline: string;
+	readonly number: number;
+}
+
+interface ParsedHeader {
+	readonly kind: "add" | "delete" | "update";
+	readonly path: string;
+}
+
+const BEGIN = "*** Begin Patch";
+const END = "*** End Patch";
+const ADD = "*** Add File: ";
+const DELETE = "*** Delete File: ";
+const UPDATE = "*** Update File: ";
+const MOVE = "*** Move to: ";
+const END_OF_FILE = "*** End of File";
+
+export const MAX_V4A_PATCH_BYTES = 1_048_576;
+export const MAX_V4A_OPERATIONS = 128;
+export const MAX_V4A_HUNKS_PER_UPDATE = 128;
+export const MAX_V4A_HUNK_LINES = 4_096;
+export const MAX_V4A_PATH_BYTES = 4_096;
+export const MAX_V4A_PATH_SEGMENT_BYTES = 255;
+
+export interface V4aPreviewOperation {
+	readonly kind: "add" | "delete" | "update";
+	readonly path: string;
+	readonly addedLines: number;
+	readonly removedLines: number;
+}
+
+type MutablePreviewOperation = {
+	kind: V4aPreviewOperation["kind"];
+	path: string;
+	addedLines: number;
+	removedLines: number;
+};
+
+export interface V4aPreviewCursor {
+	consumed: string;
+	bytes: number;
+	operations: MutablePreviewOperation[];
+	stopped: boolean;
+}
+
+export function createV4aPreviewCursor(): V4aPreviewCursor {
+	return { consumed: "", bytes: 0, operations: [], stopped: false };
+}
+
+export function previewV4aPatchPrefix(
+	input: string,
+	argsComplete = false,
+	cursor?: V4aPreviewCursor,
+): readonly V4aPreviewOperation[] {
+	const state = cursor ?? createV4aPreviewCursor();
+	if (!input.startsWith(state.consumed)) {
+		state.consumed = "";
+		state.bytes = 0;
+		state.operations = [];
+		state.stopped = false;
+	}
+	if (state.stopped) return freezePreview(state.operations);
+
+	const lines = splitLines(input.slice(state.consumed.length));
+	for (const [index, line] of lines.entries()) {
+		if (line === undefined) break;
+		const encoded = `${line.text}${line.newline}`;
+		const size = Buffer.byteLength(encoded, "utf8");
+		if (state.bytes + size > MAX_V4A_PATCH_BYTES) {
+			state.stopped = true;
+			break;
+		}
+		const complete = line.newline !== "" || (argsComplete && index === lines.length - 1);
+		if (!complete) break;
+		const applied = applyPreviewLine(state, line.text);
+		if (!applied) {
+			state.stopped = true;
+			break;
+		}
+		state.bytes += size;
+		state.consumed += encoded;
+	}
+
+	return freezePreview(state.operations);
+}
+
+/** Counts unique completed operation paths. Ignores payload lines and partial last lines. */
+export function previewV4aPatchFileCount(input: string, cursor?: V4aPreviewCursor): number {
+	if (cursor !== undefined)
+		return new Set(previewV4aPatchPrefix(input, false, cursor).map((operation) => operation.path))
+			.size;
+	const paths = new Set<string>();
+	let last: string | undefined;
+	let offset = 0;
+	let bytes = 0;
+	while (offset < input.length) {
+		const newline = input.indexOf("\n", offset);
+		if (newline < 0) break;
+		let text = input.slice(offset, newline);
+		if (text.endsWith("\r")) text = text.slice(0, -1);
+		const size = newline + 1 - offset;
+		if (bytes + size > MAX_V4A_PATCH_BYTES || paths.size >= MAX_V4A_OPERATIONS) break;
+		bytes += size;
+		offset = newline + 1;
+		if (text === END) continue;
+		const header = parseHeader(text);
+		if (header !== undefined) {
+			if (!isPreviewablePath(header.path)) break;
+			last = header.path;
+			paths.add(header.path);
+			continue;
+		}
+		if (last !== undefined && text.startsWith(MOVE)) {
+			const moveTo = text.slice(MOVE.length);
+			if (!isPreviewablePath(moveTo)) break;
+			paths.delete(last);
+			paths.add(moveTo);
+			last = moveTo;
+		}
+	}
+	return paths.size;
+}
+
+function applyPreviewLine(state: V4aPreviewCursor, text: string): boolean {
+	if (text === BEGIN) return true;
+	if (text === END) return true;
+	const header = parseHeader(text);
+	if (header !== undefined) {
+		if (!isPreviewablePath(header.path) || state.operations.length >= MAX_V4A_OPERATIONS)
+			return false;
+		state.operations.push({ kind: header.kind, path: header.path, addedLines: 0, removedLines: 0 });
+		return true;
+	}
+	const current = state.operations.at(-1);
+	if (current === undefined) return true;
+	if (current.kind === "update" && text.startsWith(MOVE)) {
+		const moveTo = text.slice(MOVE.length);
+		if (!isPreviewablePath(moveTo)) return false;
+		current.path = moveTo;
+		return true;
+	}
+	if (current.kind === "add") {
+		if (text === "") return true;
+		if (!text.startsWith("+")) return false;
+		if (text.slice(1).length > 0) current.addedLines += 1;
+		return true;
+	}
+	if (current.kind === "delete") return false;
+	if (text.startsWith("@@") || text.startsWith(" ") || text === "") return true;
+	if (text.startsWith("+")) {
+		current.addedLines += 1;
+		return true;
+	}
+	if (text.startsWith("-")) {
+		current.removedLines += 1;
+		return true;
+	}
+	return false;
+}
+
+function freezePreview(
+	operations: readonly MutablePreviewOperation[],
+): readonly V4aPreviewOperation[] {
+	return Object.freeze(operations.map((operation) => Object.freeze({ ...operation })));
+}
+
+function isPreviewablePath(path: string): boolean {
+	try {
+		assertPatchPath(path);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+export function parseV4aPatch(input: string): V4aPatch {
+	return Object.freeze({ operations: Object.freeze([...parseV4aPatchOperations(input)]) });
+}
+
+/**
+ * Parses a V4A patch one complete operation at a time. Callers may present
+ * parsed operations before workspace validation or mutation begins.
+ */
+export async function parseV4aPatchProgressively(
+	input: string,
+	onOperation: (operation: V4aPatchOperation, index: number) => void | Promise<void>,
+): Promise<V4aPatch> {
+	const operations: V4aPatchOperation[] = [];
+	for (const operation of parseV4aPatchOperations(input)) {
+		operations.push(operation);
+		await onOperation(operation, operations.length - 1);
+	}
+	return Object.freeze({ operations: Object.freeze(operations) });
+}
+
+function* parseV4aPatchOperations(input: string): Generator<V4aPatchOperation> {
+	if (Buffer.byteLength(input, "utf8") > MAX_V4A_PATCH_BYTES)
+		throw parseError(`patch exceeds ${MAX_V4A_PATCH_BYTES} byte limit`);
+	const lines = normalizeEnvelope(splitLines(input));
+	if (lines.length < 2 || lines[0]?.text !== BEGIN)
+		throw parseError("missing Begin Patch envelope", lines[0]?.number ?? 1);
+
+	let index = 1;
+	let operationCount = 0;
+
+	while (index < lines.length) {
+		const current = lines[index];
+		if (current === undefined) throw parseError("unexpected end of patch", lines.at(-1)?.number);
+		if (current.text === END) {
+			if (operationCount === 0) throw parseError("patch contains no actions", lines[0]?.number);
+			if (index + 1 !== lines.length)
+				throw parseError("content after End Patch envelope", lines[index + 1]?.number);
+			return;
+		}
+		if (operationCount >= MAX_V4A_OPERATIONS)
+			throw parseError(`patch exceeds ${MAX_V4A_OPERATIONS} operation limit`, current.number);
+		const header = parseHeader(current.text);
+		if (header === undefined)
+			throw parseError(`unknown patch header: ${current.text}`, current.number);
+		assertPatchPath(header.path, current.number);
+
+		if (header.kind === "add") {
+			const result = parseAdd(lines, index + 1, header.path);
+			operationCount += 1;
+			yield result.operation;
+			index = result.nextIndex;
+			continue;
+		}
+
+		if (header.kind === "delete") {
+			const nextIndex = index + 1;
+			if (nextIndex < lines.length && !isHeaderOrEnd(lines[nextIndex]?.text ?? ""))
+				throw parseError("Delete actions cannot contain body lines", lines[nextIndex]?.number);
+			operationCount += 1;
+			yield Object.freeze({ kind: "delete", path: header.path });
+			index = nextIndex;
+			continue;
+		}
+
+		const result = parseUpdate(lines, index + 1, header.path);
+		operationCount += 1;
+		yield result.operation;
+		index = result.nextIndex;
+	}
+
+	throw parseError("missing End Patch envelope", lines.at(-1)?.number);
+}
+
+export function operationTouchedPaths(operation: V4aPatchOperation): readonly string[] {
+	return operation.kind === "update" && operation.moveTo !== undefined
+		? [operation.path, operation.moveTo]
+		: [operation.path];
+}
+
+/** Finds operation graph conflicts without reading or mutating the workspace. */
+export function findV4aPatchConflicts(patch: V4aPatch): readonly V4aPatchConflict[] {
+	const touched = new Map<
+		string,
+		{ readonly index: number; readonly operation: V4aPatchOperation }[]
+	>();
+	for (const [index, operation] of patch.operations.entries()) {
+		for (const path of operationTouchedPaths(operation)) {
+			const indices = touched.get(path) ?? [];
+			indices.push({ index, operation });
+			touched.set(path, indices);
+		}
+	}
+	const conflicts: V4aPatchConflict[] = [];
+	for (const [path, touches] of touched) {
+		const operationIndices = Object.freeze([...new Set(touches.map(({ index }) => index))]);
+		const repeatedWithinOperation = touches.length !== operationIndices.length;
+		const compatibleReplace =
+			operationIndices.length === 2 &&
+			touches.every(({ operation }) => operation.kind === "add" || operation.kind === "delete") &&
+			new Set(touches.map(({ operation }) => operation.kind)).size === 2;
+		const compatibleUpdates =
+			!repeatedWithinOperation &&
+			touches.every(
+				({ operation }) => operation.kind === "update" && operation.moveTo === undefined,
+			);
+		if (
+			!repeatedWithinOperation &&
+			(operationIndices.length < 2 || compatibleReplace || compatibleUpdates)
+		)
+			continue;
+		conflicts.push(
+			Object.freeze({
+				path,
+				operationIndices,
+				message: `path touched more than once: ${path}`,
+			}),
+		);
+	}
+	return Object.freeze(conflicts);
+}
+
+export function compileV4aUpdateToUnifiedDiff(operation: V4aUpdateOperation): string {
+	if (operation.hunks.length === 0) return "";
+	const oldPath = `a/${operation.path}`;
+	// Move is a separate Publish/unlink. Unified-diff headers must not turn
+	// an update into a rename; jsdiff never chooses the destination path.
+	const newPath = `b/${operation.path}`;
+	const out: string[] = [`--- ${oldPath}\n`, `+++ ${newPath}\n`];
+
+	for (const hunk of operation.hunks) {
+		const oldCount = hunk.lines.filter((line) => line.kind !== "add").length;
+		const newCount = hunk.lines.filter((line) => line.kind !== "remove").length;
+		const oldStart = oldCount === 0 ? 0 : 1;
+		const newStart = newCount === 0 ? 0 : 1;
+		out.push(`@@ -${oldStart},${oldCount} +${newStart},${newCount} @@${hunk.anchor ?? ""}\n`);
+		for (const line of hunk.lines) {
+			const prefix = line.kind === "add" ? "+" : line.kind === "remove" ? "-" : " ";
+			out.push(`${prefix}${line.text}`);
+			if (line.noNewline === true) out.push("\\ No newline at end of file\n");
+		}
+	}
+
+	return out.join("");
+}
+
+function parseAdd(
+	lines: readonly SourceLine[],
+	start: number,
+	path: string,
+): { readonly operation: V4aAddOperation; readonly nextIndex: number } {
+	let index = start;
+	const content: string[] = [];
+	while (index < lines.length) {
+		const line = lines[index];
+		if (line === undefined) throw parseError("unexpected end of add action");
+		if (line.text === BEGIN)
+			throw parseError("Begin Patch must appear only as the first line of the patch");
+		if (line.text === END && content.length === 0)
+			throw parseError("End Patch cannot appear before Add File content");
+		if (isHeaderOrEnd(line.text)) break;
+		if (line.text === "") {
+			content.push("", line.newline);
+			index += 1;
+			continue;
+		}
+		if (!line.text.startsWith("+"))
+			throw parseError("Add content lines must begin with +", line.number);
+		content.push(line.text.slice(1), line.newline);
+		index += 1;
+	}
+	if (content.length === 0) throw parseError("Add action must contain content");
+	return {
+		operation: Object.freeze({ kind: "add", path, content: content.join("") }),
+		nextIndex: index,
+	};
+}
+
+function parseUpdate(
+	lines: readonly SourceLine[],
+	start: number,
+	path: string,
+): { readonly operation: V4aUpdateOperation; readonly nextIndex: number } {
+	let index = start;
+	let moveTo: string | undefined;
+	const moveLine = lines[index];
+	if (moveLine?.text.startsWith(MOVE)) {
+		moveTo = moveLine.text.slice(MOVE.length);
+		assertPatchPath(moveTo, moveLine.number);
+		index += 1;
+	}
+
+	const hunks: V4aUpdateHunk[] = [];
+	let current: { anchors: string[]; endOfFile?: true; lines: V4aUpdateLine[] } = {
+		anchors: [],
+		lines: [],
+	};
+	let hasChange = false;
+
+	while (index < lines.length) {
+		const line = lines[index];
+		if (line === undefined) throw parseError("unexpected end of update action");
+		if (line.text === BEGIN)
+			throw parseError("Begin Patch must appear only as the first line of the patch");
+		if (
+			line.text === END &&
+			current.lines.length === 0 &&
+			hunks.length === 0 &&
+			moveTo === undefined
+		)
+			throw parseError("End Patch cannot appear before Update File body");
+		if (isHeaderOrEnd(line.text)) break;
+		if (line.text.startsWith(MOVE))
+			throw parseError("Move to must appear immediately after Update File", line.number);
+		if (current.endOfFile)
+			throw parseError("End of File must be the final update constraint", line.number);
+		if (line.text === "\\ No newline at end of file") {
+			const previous = current.lines.at(-1);
+			if (previous === undefined)
+				throw parseError("No newline marker must follow update body lines", line.number);
+			current.lines[current.lines.length - 1] = Object.freeze({
+				...previous,
+				noNewline: true as const,
+			});
+			index += 1;
+			continue;
+		}
+		if (line.text === END_OF_FILE) {
+			if (current.lines.length === 0)
+				throw parseError("End of File must follow update body lines", line.number);
+			current.endOfFile = true;
+			index += 1;
+			continue;
+		}
+		if (line.text.startsWith("@@")) {
+			const anchor = line.text.slice(2).trim();
+			if (current.lines.length > 0) {
+				hunks.push(freezeHunk(current));
+				current = { anchors: anchor.length === 0 ? [] : [anchor], lines: [] };
+			} else if (anchor.length > 0) current.anchors.push(anchor);
+			index += 1;
+			continue;
+		}
+		const parsedLine = parseUpdateLine(line);
+		if (parsedLine.kind !== "context") hasChange = true;
+		current.lines.push(parsedLine);
+		index += 1;
+	}
+
+	if (current.lines.length > 0) hunks.push(freezeHunk(current));
+	if (hunks.length > MAX_V4A_HUNKS_PER_UPDATE)
+		throw parseError(`Update action exceeds ${MAX_V4A_HUNKS_PER_UPDATE} hunk limit`);
+	if (hunks.some((hunk) => hunk.lines.length > MAX_V4A_HUNK_LINES))
+		throw parseError(`Update action exceeds ${MAX_V4A_HUNK_LINES} lines per hunk limit`);
+	if (hunks.length === 0 && moveTo === undefined)
+		throw parseError("Update action must contain body lines");
+	if (hunks.length > 0 && !hasChange) throw parseError("Update action must change content");
+	const frozenHunks = Object.freeze([...hunks]);
+	return {
+		operation: Object.freeze(
+			moveTo === undefined
+				? { kind: "update" as const, path, hunks: frozenHunks }
+				: { kind: "update" as const, path, moveTo, hunks: frozenHunks },
+		),
+		nextIndex: index,
+	};
+}
+
+function parseUpdateLine(line: SourceLine): V4aUpdateLine {
+	if (line.text === "") return Object.freeze({ kind: "context", text: line.newline });
+	const marker = line.text[0];
+	const text = `${line.text.slice(1)}${line.newline}`;
+	if (marker === " ") return Object.freeze({ kind: "context", text });
+	if (marker === "+") return Object.freeze({ kind: "add", text });
+	if (marker === "-") return Object.freeze({ kind: "remove", text });
+	throw parseError("Update body lines must begin with space, +, -, or @@", line.number);
+}
+
+function freezeHunk(hunk: {
+	readonly anchors: readonly string[];
+	readonly endOfFile?: true;
+	readonly lines: readonly V4aUpdateLine[];
+}): V4aUpdateHunk {
+	const lines = Object.freeze([...hunk.lines]);
+	const anchors = Object.freeze([...hunk.anchors]);
+	const anchor = anchors.at(-1);
+	return Object.freeze({
+		...(anchor === undefined ? {} : { anchor }),
+		...(anchors.length > 1 ? { anchors } : {}),
+		...(hunk.endOfFile === undefined ? {} : { endOfFile: true as const }),
+		lines,
+	});
+}
+
+function parseHeader(text: string): ParsedHeader | undefined {
+	if (text.startsWith(ADD)) return { kind: "add", path: text.slice(ADD.length) };
+	if (text.startsWith(DELETE)) return { kind: "delete", path: text.slice(DELETE.length) };
+	if (text.startsWith(UPDATE)) return { kind: "update", path: text.slice(UPDATE.length) };
+	return undefined;
+}
+
+function assertPatchPath(path: string, line?: number): void {
+	if (path.length === 0) throw parseError("empty path in patch header", line);
+	if (path === BEGIN || path === END)
+		throw parseError("patch envelope markers cannot be used as file paths", line);
+	if (Buffer.byteLength(path, "utf8") > MAX_V4A_PATH_BYTES)
+		throw parseError(`path exceeds ${MAX_V4A_PATH_BYTES} byte limit`, line);
+	if (
+		path
+			.split("/")
+			.some((segment) => Buffer.byteLength(segment, "utf8") > MAX_V4A_PATH_SEGMENT_BYTES)
+	)
+		throw parseError(`path segment exceeds ${MAX_V4A_PATH_SEGMENT_BYTES} byte limit`, line);
+}
+
+function isHeaderOrEnd(text: string): boolean {
+	return text === END || text.startsWith(ADD) || text.startsWith(DELETE) || text.startsWith(UPDATE);
+}
+function splitLines(input: string): readonly SourceLine[] {
+	const matches = input.matchAll(/([^\r\n]*)(\r\n|\n|\r|$)/g);
+	const lines: SourceLine[] = [];
+	for (const match of matches) {
+		const rawText = match[1] ?? "";
+		const newline = match[2] ?? "";
+		const text = lines.length === 0 ? rawText.replace(/^\uFEFF/, "") : rawText;
+		if (text.length === 0 && newline.length === 0) break;
+		lines.push({ text, newline, number: lines.length + 1 });
+	}
+	return lines;
+}
+
+function normalizeEnvelope(lines: readonly SourceLine[]): readonly SourceLine[] {
+	let start = 0;
+	let end = lines.length;
+	while (start < end && lines[start]?.text === "") start += 1;
+	while (end > start && lines[end - 1]?.text === "") end -= 1;
+	let normalized = lines.slice(start, end);
+	const first = normalized[0]?.text;
+	const last = normalized[normalized.length - 1]?.text;
+	if ((first === "```" || first === "```patch" || first === "```diff") && last === "```") {
+		normalized = normalized.slice(1, -1);
+		start = 0;
+		end = normalized.length;
+		while (start < end && normalized[start]?.text === "") start += 1;
+		while (end > start && normalized[end - 1]?.text === "") end -= 1;
+		normalized = normalized.slice(start, end);
+	}
+	return keepOuterEnvelope(normalized);
+}
+
+function keepOuterEnvelope(lines: readonly SourceLine[]): readonly SourceLine[] {
+	const start = lines.findIndex((line) => line.text === BEGIN);
+	let end = -1;
+	for (let index = lines.length - 1; index >= 0; index -= 1) {
+		if (lines[index]?.text === END) {
+			end = index;
+			break;
+		}
+	}
+	if (start < 0 || end <= start) return lines;
+	const inner = lines
+		.slice(start + 1, end)
+		.filter((line) => line.text !== BEGIN && line.text !== END);
+	return [lines[start] as SourceLine, ...inner, lines[end] as SourceLine];
+}
+
+function parseError(message: string, line?: number): SyntaxError {
+	return new SyntaxError(
+		`Invalid V4A patch: ${message}${line === undefined ? "" : ` at line ${line}`}`,
+	);
+}
